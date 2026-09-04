@@ -88,18 +88,27 @@ else
   exit 1
 fi
 
-if [ -d "/var/lib/marzban/mysql" ] || [ -d "/var/lib/mysql/marzban" ]; then
-
 path=""
+mysql_container="marzban-mysql-1"
 
-if [ -d "/var/lib/marzban/mysql" ]; then
-  path="/var/lib/marzban/mysql"
-elif [ -d "/var/lib/mysql/marzban" ]; then
-  path="/var/lib/mysql/marzban"
-else
-  echo "Neither path exists."
-  exit 1
+# Prefer the real host path mounted at /var/lib/mysql. This also supports
+# custom bind mounts such as /var/lib/marzban-mysql and Docker named volumes.
+if docker inspect "$mysql_container" >/dev/null 2>&1; then
+  path=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/mysql"}}{{.Source}}{{end}}{{end}}' "$mysql_container")
 fi
+
+# Keep compatibility with older Marzban layouts when the container is stopped
+# or Docker mount inspection is not available.
+if [ -z "$path" ]; then
+  for candidate in /var/lib/marzban-mysql /var/lib/marzban/mysql /var/lib/mysql/marzban; do
+    if [ -d "$candidate" ]; then
+      path="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -n "$path" ] && [ -d "$path" ]; then
 
   sed -i -e 's/\s*=\s*/=/' -e 's/\s*:\s*/:/' -e 's/^\s*//' /opt/marzban/.env
 
@@ -108,6 +117,8 @@ fi
 
     cat > "$path/ac-backup.sh" <<EOL
 #!/bin/bash
+
+set -Eeuo pipefail
 
 USER="root"
 PASSWORD="$MYSQL_ROOT_PASSWORD"
@@ -128,14 +139,23 @@ chmod +x "$path/ac-backup.sh"
 
 ZIP=$(cat <<EOF
 
+set -Eeuo pipefail
 docker exec marzban-mysql-1 bash -c "/var/lib/mysql/ac-backup.sh"
-zip -r /root/ac-backup-m.zip /opt/marzban/* /var/lib/marzban/* /opt/marzban/.env -x $path/\*
-zip -r /root/ac-backup-m.zip $path/db-backup/*
-rm -rf "$path/db-backup/*"
+if ! find "$path/db-backup" -maxdepth 1 -type f -name '*.sql' -size +0c -print -quit | grep -q .; then
+  echo "Database backup failed: no non-empty SQL dump was created in $path/db-backup." >&2
+  exit 1
+fi
+zip -r /root/ac-backup-m.zip /opt/marzban/* /var/lib/marzban/* /opt/marzban/.env -x "$path/*"
+zip -r /root/ac-backup-m.zip "$path"/db-backup/*.sql
+rm -f -- "$path"/db-backup/*.sql
 EOF
 )
 
     else
+      if docker inspect "$mysql_container" >/dev/null 2>&1; then
+        echo "MySQL container exists, but its /var/lib/mysql host mount could not be found." >&2
+        exit 1
+      fi
       ZIP="zip -r /root/ac-backup-m.zip ${dir}/* /var/lib/marzban/* /opt/marzban/.env"
 fi
 
@@ -231,6 +251,8 @@ sudo apt install zip -y
 
 cat > "/root/ac-backup-${xmhs}.sh" <<EOL
 #!/bin/bash
+
+set -Eeuo pipefail
 
 rm -f /root/ac-backup-${xmhs}.zip
 $ZIP
